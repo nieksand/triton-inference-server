@@ -1173,7 +1173,6 @@ HTTPAPIServerV2::HandleSystemSharedMemory(
     err = shm_manager_->GetStatusV2(
         region_name, &shm_status, TRTSERVER_MEMORY_CPU);
     if (err == nullptr) {
-      rapidjson::Value response_regions(rapidjson::kArrayType);
       for (int i = 0; i < shm_status.shared_memory_region_size(); i++) {
         const auto& rshm_region = shm_status.shared_memory_region(i);
         if (rshm_region.has_system_shared_memory()) {
@@ -1192,11 +1191,9 @@ HTTPAPIServerV2::HandleSystemSharedMemory(
           uint64_t byte_size = rshm_region.byte_size();
           rapidjson::Value byte_size_val(byte_size);
           shm_region.AddMember("byte_size", byte_size_val, allocator);
-          response_regions.PushBack(shm_region, allocator);
+          document.PushBack(shm_region, allocator);
         }
       }
-      document.AddMember(
-          "system shared memory status", response_regions, allocator);
 
       rapidjson::StringBuffer buffer;
       buffer.Clear();
@@ -1273,7 +1270,6 @@ HTTPAPIServerV2::HandleCudaSharedMemory(
     err = shm_manager_->GetStatusV2(
         region_name, &shm_status, TRTSERVER_MEMORY_GPU);
     if (err == nullptr) {
-      rapidjson::Value response_regions(rapidjson::kArrayType);
       for (int i = 0; i < shm_status.shared_memory_region_size(); i++) {
         const auto& rshm_region = shm_status.shared_memory_region(i);
         if (rshm_region.has_cuda_shared_memory()) {
@@ -1288,11 +1284,9 @@ HTTPAPIServerV2::HandleCudaSharedMemory(
           uint64_t byte_size = rshm_region.byte_size();
           rapidjson::Value byte_size_val(byte_size);
           shm_region.AddMember("byte_size", byte_size_val, allocator);
-          response_regions.PushBack(shm_region, allocator);
+          document.PushBack(shm_region, allocator);
         }
       }
-      document.AddMember(
-          "cuda shared memory status", response_regions, allocator);
 
       rapidjson::StringBuffer buffer;
       buffer.Clear();
