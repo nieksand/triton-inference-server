@@ -205,7 +205,9 @@ class HTTPAPIServerV2 : public HTTPServerV2Impl {
         trace_manager_(trace_manager), shm_manager_(shm_manager),
         allocator_(nullptr), server_regex_(R"(/v2(?:/health/(live|ready))?)"),
         model_regex_(
-            R"(/v2/models/([^/]+)(?:/version/([0-9]+))?(?:/(infer|ready))?)")
+            R"(/v2/models/([^/]+)(?:/version/([0-9]+))?(?:/(infer|ready))?)"),
+        systemsharedmemory_regex_(
+            R"(/v2/systemsharedmemory(?:/region/([^/]+))?/(status|register|unregister))")
   {
     TRTSERVER_Error* err = TRTSERVER_ServerId(server_.get(), &server_id_);
     if (err != nullptr) {
@@ -306,16 +308,19 @@ class HTTPAPIServerV2 : public HTTPServerV2Impl {
 
   void Handle(evhtp_request_t* req) override;
   void HandleServerHealth(evhtp_request_t* req, const std::string& kind);
+  void HandleServerMetadata(evhtp_request_t* req);
   void HandleModelReady(
       evhtp_request_t* req, const std::string& model_name,
       const std::string& model_version_str);
-  void HandleServerMetadata(evhtp_request_t* req);
   void HandleModelMetadata(
       evhtp_request_t* req, const std::string& model_name,
       const std::string& model_version_str);
   void HandleInfer(
       evhtp_request_t* req, const std::string& model_name,
       const std::string& model_version_str);
+  void HandleSystemSharedMemory(
+      evhtp_request_t* req, const std::string& region_name,
+      const std::string& action);
 
 #ifdef TRTIS_ENABLE_GPU
   TRTSERVER_Error* EVBufferToCudaHandle(
@@ -344,6 +349,7 @@ class HTTPAPIServerV2 : public HTTPServerV2Impl {
 
   re2::RE2 server_regex_;
   re2::RE2 model_regex_;
+  re2::RE2 systemsharedmemory_regex_;
 };
 
 TRTSERVER_Error*
@@ -804,7 +810,7 @@ HTTPAPIServerV2::Handle(evhtp_request_t* req)
     }
   }
 
-  std::string rest;
+  std::string region, action, rest;
   if (std::string(req->uri->path->full) == "/v2") {
     // server metadata
     HandleServerMetadata(req);
@@ -813,6 +819,12 @@ HTTPAPIServerV2::Handle(evhtp_request_t* req)
                  std::string(req->uri->path->full), server_regex_, &rest)) {
     // server health
     HandleServerHealth(req, rest);
+    return;
+  } else if (RE2::FullMatch(
+                 std::string(req->uri->path->full), systemsharedmemory_regex_,
+                 &region, &action)) {
+    // system shared memory
+    HandleSystemSharedMemory(req, region, action);
     return;
   }
 
@@ -1125,6 +1137,70 @@ HTTPAPIServerV2::HandleServerMetadata(evhtp_request_t* req)
   }
 
   TRTSERVER_ErrorDelete(err);
+}
+
+void
+HTTPAPIServerV2::HandleSystemSharedMemory(
+    evhtp_request_t* req, const std::string& region_name,
+    const std::string& action)
+{
+  if ((action == "status") && (req->method != htp_method_GET)) {
+    evhtp_send_reply(req, EVHTP_RES_METHNALLOWED);
+    return;
+  } else if ((action != "status") && (req->method != htp_method_POST)) {
+    evhtp_send_reply(req, EVHTP_RES_METHNALLOWED);
+    return;
+  }
+
+  TRTSERVER_Error* err;
+  rapidjson::Document document;
+  document.SetObject();
+  rapidjson::Document::AllocatorType& allocator = document.GetAllocator();
+  if (action == "status") {
+    SharedMemoryStatus shm_status;
+    err = shm_manager_->GetStatus(&shm_status);
+    if (err == nullptr) {
+      rapidjson::Value response_regions(rapidjson::kArrayType);
+      for (int i = 0; i < shm_status.shared_memory_region_size(); i++) {
+        const auto& rshm_region = shm_status.shared_memory_region(i);
+        if (rshm_region.has_system_shared_memory()) {
+          rapidjson::Value shm_region;
+          shm_region.SetObject();
+          std::string name = rshm_region.name();
+          rapidjson::Value name_val(name.c_str(), name.size());
+          shm_region.AddMember("name", name_val, allocator);
+          std::string key =
+              rshm_region.system_shared_memory().shared_memory_key();
+          rapidjson::Value key_val(key.c_str(), key.size());
+          shm_region.AddMember("key", key_val, allocator);
+          uint64_t offset = rshm_region.system_shared_memory().offset();
+          rapidjson::Value offset_val(offset);
+          shm_region.AddMember("offset", offset_val, allocator);
+          uint64_t byte_size = rshm_region.byte_size();
+          rapidjson::Value byte_size_val(byte_size);
+          shm_region.AddMember("byte_size", byte_size_val, allocator);
+          response_regions.PushBack(shm_region, allocator);
+        }
+      }
+      document.AddMember(
+          "system shared memory status", response_regions, allocator);
+    }
+    rapidjson::StringBuffer buffer;
+    buffer.Clear();
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    document.Accept(writer);
+    std::string status_buffer(buffer.GetString());
+
+    evbuffer_add(req->buffer_out, status_buffer.c_str(), status_buffer.size());
+    evhtp_send_reply(req, EVHTP_RES_OK);
+    TRTSERVER_ErrorDelete(err);
+  } else {
+    if (action == "register") {
+      // err = shm_manager_->RegisterSystemSharedMemory(
+      //     name.c_str(), shm_key.c_str(), offset, byte_size);
+    } else {
+    }
+  }
 }
 
 bool
@@ -1681,8 +1757,8 @@ HTTPAPIServerV2::InferRequestClass::FinalizeResponse(
       TRTSERVER_Memory_Type memory_type;
       int64_t memory_type_id;
       err = TRTSERVER2_InferenceRequestOutputData(
-              request, output_name.c_str(), &base, &byte_size, &memory_type,
-              &memory_type_id);
+          request, output_name.c_str(), &base, &byte_size, &memory_type,
+          &memory_type_id);
       if (err != nullptr) {
         return EVHTP_RES_BADREQ;
       }
@@ -1716,8 +1792,8 @@ HTTPAPIServerV2::InferRequestClass::FinalizeResponse(
   rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
   response_meta_data_.response_json_.Accept(writer);
   std::string response_metadata(buffer.GetString());
-  evbuffer_add(req_->buffer_out, response_metadata.c_str(),
-      response_metadata.size());
+  evbuffer_add(
+      req_->buffer_out, response_metadata.c_str(), response_metadata.size());
 
   evhtp_headers_add_header(
       req_->headers_out,
